@@ -39,7 +39,19 @@
 // Ueber den seriellen Monitor umschaltbar: 't' = TX, 'r' = RX
 // ---------------------------------------------------------------------------
 #define START_IN_RX_MODE  0
-#define TX_INTERVAL_MS    2000
+#define TX_INTERVAL_MS    2000   // Achtung 868-MHz-Duty-Cycle (1 %): nicht zu oft senden
+
+// ---------------------------------------------------------------------------
+// GY-BME280 / GY-BMP280 (I2C)
+//   VCC -> 3.3V, GND -> GND, SCL -> 19, SDA -> 18
+// Nachrichtenformat (CSV, eine Zeile pro Paket):
+//   Zaehler,ms_seit_start,Temp_C,Druck_hPa,Feuchte_%,Hoehe_m
+//   Feuchte ist leer beim BMP280; "NOSENSOR" wenn nichts gefunden.
+// ---------------------------------------------------------------------------
+// Standardwert fuer den Luftdruck auf Meereshoehe (QNH / "relativer Luftdruck NHN").
+// Wird ueberschrieben, sobald die Bodenstation per Funk "QNH=<hPa>" schickt;
+// der empfangene Wert bleibt im EEPROM gespeichert.
+#define SEA_LEVEL_HPA     1013.25f
 
 // Optionale Bytes, die vor jede Nachricht gesetzt werden (z.B. Adress-Header,
 // falls der Waveshare-Stick so etwas erwartet). Leer lassen = rohes LoRa.

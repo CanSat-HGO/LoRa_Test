@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <RadioLib.h>
 #include "config.h"
+#include "sensor.h"
 
 RFM95 radio = new Module(PIN_LORA_CS, PIN_LORA_DIO0, PIN_LORA_RST, RADIOLIB_NC);
 
@@ -34,8 +35,9 @@ static void startRx() {
 
 static void startTxMode() {
   rxMode = false;
-  radio.standby();
-  Serial.println("[TX] Sendemodus aktiv");
+  irqFlag = false;
+  radio.startReceive();  // zwischen den Messungen auf Befehle hoeren
+  Serial.println("[TX] Sendemodus aktiv (hoert zwischendurch auf Befehle)");
 }
 
 static void handleSerialCommands() {
@@ -46,16 +48,10 @@ static void handleSerialCommands() {
   }
 }
 
-static void doTx() {
-  static uint32_t lastTx = 0;
-  static uint32_t counter = 0;
-  if (millis() - lastTx < TX_INTERVAL_MS) return;
-  lastTx = millis();
-
-  char text[64];
-  int textLen = snprintf(text, sizeof(text), "Hallo vom Teensy #%lu\r\n",(unsigned long)counter++);
-
-  uint8_t pkt[sizeof(txHeader) + sizeof(text)];
+// Sendet eine Textzeile (mit Waveshare-Header) und hoert danach wieder zu.
+static bool sendLine(const char *text, size_t textLen) {
+  uint8_t pkt[sizeof(txHeader) + 128];
+  if (textLen > 128) textLen = 128;
   memcpy(pkt, txHeader, sizeof(txHeader));
   memcpy(pkt + sizeof(txHeader), text, textLen);
   size_t len = sizeof(txHeader) + textLen;
@@ -70,22 +66,88 @@ static void doTx() {
   } else {
     Serial.printf("[TX] Fehler %d\n", state);
   }
+  // TX-Done-Interrupt verwerfen und zwischen den Messungen empfangsbereit sein
+  irqFlag = false;
+  radio.startReceive();
+  return state == RADIOLIB_ERR_NONE;
 }
 
-static void doRx() {
+// Bestaetigung wird verzoegert gesendet: der Waveshare-Stick braucht nach dem
+// eigenen Senden etwas Zeit, bis er wieder empfangsbereit ist.
+static const uint32_t ACK_DELAY_MS = 400;
+static char pendingAck[40];
+static int pendingAckLen = 0;
+static uint32_t pendingAckAt = 0;
+
+static void sendPendingAck() {
+  if (pendingAckLen == 0 || (int32_t)(millis() - pendingAckAt) < 0) return;
+  sendLine(pendingAck, pendingAckLen);
+  pendingAckLen = 0;
+}
+
+// Befehle von der Bodenstation (Nutzdaten ohne Header), z.B. "QNH=985.0"
+static void handleCommand(const char *cmd) {
+  if (strncmp(cmd, "QNH=", 4) == 0) {
+    float hpa = atof(cmd + 4);
+    if (hpa >= 900.0f && hpa <= 1100.0f) {
+      sensorSetSeaLevel(hpa);
+      Serial.printf("[CMD] QNH gesetzt: %.2f hPa\n", hpa);
+      pendingAckLen = snprintf(pendingAck, sizeof(pendingAck), "ACK,QNH,%.2f\r\n", hpa);
+      pendingAckAt = millis() + ACK_DELAY_MS;
+    } else {
+      Serial.printf("[CMD] QNH ungueltig: %s\n", cmd + 4);
+    }
+  } else {
+    Serial.printf("[CMD] unbekannt: %s\n", cmd);
+  }
+}
+
+static void doTx() {
+  static uint32_t lastTx = 0;
+  static uint32_t counter = 0;
+  if (millis() - lastTx < TX_INTERVAL_MS) return;
+  lastTx = millis();
+
+  char text[96];
+  int textLen;
+  SensorData sd = sensorRead();
+  if (sd.valid) {
+    char hum[12] = "";
+    if (!isnan(sd.humidity)) snprintf(hum, sizeof(hum), "%.1f", sd.humidity);
+    textLen = snprintf(text, sizeof(text), "%lu,%lu,%.2f,%.2f,%s,%.1f\r\n",
+                       (unsigned long)counter++, (unsigned long)millis(),
+                       sd.tempC, sd.pressureHpa, hum, sd.altitudeM);
+  } else {
+    textLen = snprintf(text, sizeof(text), "%lu,%lu,NOSENSOR\r\n",
+                       (unsigned long)counter++, (unsigned long)millis());
+  }
+
+  sendLine(text, textLen);
+}
+
+static void pollRx(bool verbose) {
   if (!irqFlag) return;
   irqFlag = false;
 
   uint8_t buf[256];
   size_t len = radio.getPacketLength();
-  if (len > sizeof(buf)) len = sizeof(buf);
+  if (len > sizeof(buf) - 1) len = sizeof(buf) - 1;
   int state = radio.readData(buf, len);
 
   if (state == RADIOLIB_ERR_NONE) {
-    Serial.printf("[RX] %u Bytes, RSSI %.1f dBm, SNR %.1f dB\n",
-                  (unsigned)len, radio.getRSSI(), radio.getSNR());
-    Serial.print("     ASCII: "); printAscii(buf, len); Serial.println();
-    Serial.print("     HEX:   "); printHex(buf, len);   Serial.println();
+    if (verbose) {
+      Serial.printf("[RX] %u Bytes, RSSI %.1f dBm, SNR %.1f dB\n",
+                    (unsigned)len, radio.getRSSI(), radio.getSNR());
+      Serial.print("     ASCII: "); printAscii(buf, len); Serial.println();
+      Serial.print("     HEX:   "); printHex(buf, len);   Serial.println();
+    }
+    // Waveshare-Header entfernen, Zeilenende abschneiden, Befehl auswerten
+    size_t off = 0;
+    if (len >= sizeof(txHeader) && memcmp(buf, txHeader, sizeof(txHeader)) == 0) off = sizeof(txHeader);
+    buf[len] = 0;
+    char *cmd = (char *)buf + off;
+    cmd[strcspn(cmd, "\r\n")] = 0;
+    if (*cmd) handleCommand(cmd);
   } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
     Serial.println("[RX] CRC-Fehler");
   } else {
@@ -106,8 +168,12 @@ void setup() {
   }
   radio.setDio0Action(onDio0, RISING);
 
+  if (sensorBegin()) Serial.printf("Sensor gefunden: %s\n", sensorName());
+  else Serial.println("WARNUNG: kein BME280/BMP280 gefunden (SDA 18, SCL 19, 3.3V pruefen)");
+
   Serial.printf("RFM95 bereit: %.1f MHz, BW %.0f kHz, SF%d, CR4/%d, Sync 0x%02X, %d dBm\n",
                 LORA_FREQ_MHZ, LORA_BW_KHZ, LORA_SF, LORA_CR, LORA_SYNC_WORD, LORA_POWER_DBM);
+  Serial.printf("QNH fuer Hoehe: %.2f hPa\n", sensorGetSeaLevel());
   Serial.println("Befehle: 't' = senden, 'r' = empfangen");
 
   if (rxMode) startRx(); else startTxMode();
@@ -115,5 +181,7 @@ void setup() {
 
 void loop() {
   handleSerialCommands();
-  if (rxMode) doRx(); else doTx();
+  pollRx(rxMode);
+  sendPendingAck();
+  if (!rxMode) doTx();
 }
